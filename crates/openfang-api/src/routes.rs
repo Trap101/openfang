@@ -3332,6 +3332,149 @@ pub async fn delete_agent_kv_key(
     }
 }
 
+/// GET /api/memory/agents/:id/kv/search — Search KV pairs by key or value substring.
+pub async fn search_agent_kv(
+    State(state): State<Arc<AppState>>,
+    Path(_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let query = params.get("q").cloned().unwrap_or_default();
+
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing 'q' query parameter"})),
+        );
+    }
+
+    match state.kernel.memory.list_kv(agent_id) {
+        Ok(pairs) => {
+            let query_lower = query.to_lowercase();
+            let results: Vec<serde_json::Value> = pairs
+                .into_iter()
+                .filter(|(k, v)| {
+                    k.to_lowercase().contains(&query_lower)
+                        || match v {
+                            serde_json::Value::String(s) => s.to_lowercase().contains(&query_lower),
+                            other => serde_json::to_string(other)
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&query_lower),
+                        }
+                })
+                .map(|(k, v)| serde_json::json!({"key": k, "value": v}))
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"results": results, "total": results.len(), "query": query})),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("Memory search failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Memory operation failed"})),
+            )
+        }
+    }
+}
+
+/// GET /api/memory/status — Memory subsystem statistics.
+pub async fn memory_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+
+    let kv_count = state
+        .kernel
+        .memory
+        .list_kv(agent_id)
+        .map(|pairs| pairs.len())
+        .unwrap_or(0);
+
+    let agent_count = state
+        .kernel
+        .memory
+        .list_agents()
+        .map(|agents| agents.len())
+        .unwrap_or(0);
+
+    let session_count = state
+        .kernel
+        .memory
+        .list_sessions()
+        .map(|sessions| sessions.len())
+        .unwrap_or(0);
+
+    // Try to get database file size
+    let db_size_bytes = state
+        .kernel
+        .config
+        .home_dir
+        .join("memory.db")
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "kv_count": kv_count,
+            "agent_count": agent_count,
+            "session_count": session_count,
+            "db_size_bytes": db_size_bytes,
+        })),
+    )
+}
+
+/// GET /api/models/fallbacks — Show the fallback provider chain and per-agent fallbacks.
+pub async fn model_fallbacks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let fallback_providers: Vec<serde_json::Value> = state
+        .kernel
+        .config
+        .fallback_providers
+        .iter()
+        .map(|fp| {
+            serde_json::json!({
+                "provider": fp.provider,
+                "model": fp.model,
+                "api_key_env": if fp.api_key_env.is_empty() { "-".to_string() } else { fp.api_key_env.clone() },
+                "base_url": fp.base_url,
+            })
+        })
+        .collect();
+
+    // Collect per-agent fallback models from running agents
+    let agent_fallbacks: Vec<serde_json::Value> = state
+        .kernel
+        .registry
+        .list()
+        .iter()
+        .filter(|e| !e.manifest.fallback_models.is_empty())
+        .map(|e| {
+            serde_json::json!({
+                "agent": e.name,
+                "agent_id": e.id.to_string(),
+                "fallback_models": e.manifest.fallback_models.iter().map(|fm| {
+                    serde_json::json!({
+                        "provider": fm.provider,
+                        "model": fm.model,
+                        "api_key_env": fm.api_key_env,
+                        "base_url": fm.base_url,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "fallback_providers": fallback_providers,
+            "agent_fallbacks": agent_fallbacks,
+        })),
+    )
+}
+
 /// GET /api/health — Minimal liveness probe (public, no auth required).
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).

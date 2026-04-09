@@ -285,8 +285,16 @@ pub async fn build_router(
         )
         // Memory endpoints
         .route(
+            "/api/memory/status",
+            axum::routing::get(routes::memory_status),
+        )
+        .route(
             "/api/memory/agents/{id}/kv",
             axum::routing::get(routes::get_agent_kv),
+        )
+        .route(
+            "/api/memory/agents/{id}/kv/search",
+            axum::routing::get(routes::search_agent_kv),
         )
         .route(
             "/api/memory/agents/{id}/kv/{key}",
@@ -537,6 +545,10 @@ pub async fn build_router(
         .route(
             "/api/models/aliases",
             axum::routing::get(routes::list_aliases),
+        )
+        .route(
+            "/api/models/fallbacks",
+            axum::routing::get(routes::model_fallbacks),
         )
         .route(
             "/api/models/custom",

@@ -314,6 +314,10 @@ enum VaultCommands {
         /// Credential key.
         key: String,
     },
+    /// Re-inject vault secrets into the running daemon environment.
+    Reload,
+    /// Show vault audit info (key count, last modified, integrity check).
+    Audit,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -516,6 +520,31 @@ enum AgentCommands {
         /// New value.
         value: String,
     },
+    /// Bind an agent to a channel/route.
+    Bind {
+        /// Agent name or ID.
+        agent: String,
+        /// Channel to bind to (e.g., "discord", "telegram", "slack").
+        #[arg(long)]
+        channel: Option<String>,
+        /// Account ID within the channel.
+        #[arg(long)]
+        account_id: Option<String>,
+        /// Peer/user ID for DM routing.
+        #[arg(long)]
+        peer_id: Option<String>,
+    },
+    /// Remove an agent binding by index.
+    Unbind {
+        /// Binding index (from `agent bindings`).
+        index: usize,
+    },
+    /// List all agent bindings.
+    Bindings {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -609,6 +638,12 @@ enum ModelsCommands {
         /// Model ID or alias (e.g. "gpt-4o", "claude-sonnet"). Interactive picker if omitted.
         model: Option<String>,
     },
+    /// Show the fallback provider chain.
+    Fallbacks {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -680,6 +715,19 @@ enum CronCommands {
         /// Job ID.
         id: String,
     },
+    /// Trigger a job to run immediately.
+    Run {
+        /// Job ID.
+        id: String,
+    },
+    /// Show status and run history for a job.
+    Status {
+        /// Job ID.
+        id: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -744,6 +792,22 @@ enum MemoryCommands {
         agent: String,
         /// Key name.
         key: String,
+    },
+    /// Search KV pairs by key prefix or value substring.
+    Search {
+        /// Agent name or ID.
+        agent: String,
+        /// Search query (matches key names and string values).
+        query: String,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show memory subsystem status and statistics.
+    Status {
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -960,6 +1024,14 @@ fn main() {
                 field,
                 value,
             } => cmd_agent_set(&agent_id, &field, &value),
+            AgentCommands::Bind {
+                agent,
+                channel,
+                account_id,
+                peer_id,
+            } => cmd_agent_bind(&agent, channel.as_deref(), account_id.as_deref(), peer_id.as_deref()),
+            AgentCommands::Unbind { index } => cmd_agent_unbind(index),
+            AgentCommands::Bindings { json } => cmd_agent_bindings(json),
         },
         Some(Commands::Workflow(sub)) => match sub {
             WorkflowCommands::List => cmd_workflow_list(),
@@ -1032,6 +1104,8 @@ fn main() {
             VaultCommands::Set { key } => cmd_vault_set(&key),
             VaultCommands::List => cmd_vault_list(),
             VaultCommands::Remove { key } => cmd_vault_remove(&key),
+            VaultCommands::Reload => cmd_vault_reload(),
+            VaultCommands::Audit => cmd_vault_audit(),
         },
         Some(Commands::New { kind }) => cmd_scaffold(kind),
         // ── New commands ────────────────────────────────────────────────
@@ -1040,6 +1114,7 @@ fn main() {
             ModelsCommands::Aliases { json } => cmd_models_aliases(json),
             ModelsCommands::Providers { json } => cmd_models_providers(json),
             ModelsCommands::Set { model } => cmd_models_set(model),
+            ModelsCommands::Fallbacks { json } => cmd_models_fallbacks(json),
         },
         Some(Commands::Gateway(sub)) => match sub {
             GatewayCommands::Start => cmd_start(cli.config, false),
@@ -1062,6 +1137,8 @@ fn main() {
             CronCommands::Delete { id } => cmd_cron_delete(&id),
             CronCommands::Enable { id } => cmd_cron_toggle(&id, true),
             CronCommands::Disable { id } => cmd_cron_toggle(&id, false),
+            CronCommands::Run { id } => cmd_cron_run(&id),
+            CronCommands::Status { id, json } => cmd_cron_status(&id, json),
         },
         Some(Commands::Sessions { agent, json }) => cmd_sessions(agent.as_deref(), json),
         Some(Commands::Logs { lines, follow }) => cmd_logs(lines, follow),
@@ -1079,6 +1156,8 @@ fn main() {
             MemoryCommands::Get { agent, key, json } => cmd_memory_get(&agent, &key, json),
             MemoryCommands::Set { agent, key, value } => cmd_memory_set(&agent, &key, &value),
             MemoryCommands::Delete { agent, key } => cmd_memory_delete(&agent, &key),
+            MemoryCommands::Search { agent, query, json } => cmd_memory_search(&agent, &query, json),
+            MemoryCommands::Status { json } => cmd_memory_status(json),
         },
         Some(Commands::Devices(sub)) => match sub {
             DevicesCommands::List { json } => cmd_devices_list(json),
@@ -1869,6 +1948,93 @@ fn cmd_agent_set(agent_id_str: &str, field: &str, value: &str) {
             eprintln!("Unknown field: {field}. Supported fields: model");
             std::process::exit(1);
         }
+    }
+}
+
+fn cmd_agent_bind(agent: &str, channel: Option<&str>, account_id: Option<&str>, peer_id: Option<&str>) {
+    if channel.is_none() && account_id.is_none() && peer_id.is_none() {
+        ui::error("At least one of --channel, --account-id, or --peer-id is required.");
+        std::process::exit(1);
+    }
+    let base = require_daemon("agent bind");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/bindings"))
+            .json(&serde_json::json!({
+                "agent": agent,
+                "match_rule": {
+                    "channel": channel,
+                    "account_id": account_id,
+                    "peer_id": peer_id,
+                }
+            }))
+            .send(),
+    );
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Failed: {}",
+            body["error"].as_str().unwrap_or("?")
+        ));
+    } else {
+        ui::success(&format!("Agent '{agent}' bound."));
+    }
+}
+
+fn cmd_agent_unbind(index: usize) {
+    let base = require_daemon("agent unbind");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .delete(format!("{base}/api/bindings/{index}"))
+            .send(),
+    );
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Failed: {}",
+            body["error"].as_str().unwrap_or("?")
+        ));
+    } else {
+        ui::success(&format!("Binding {index} removed."));
+    }
+}
+
+fn cmd_agent_bindings(json: bool) {
+    let base = require_daemon("agent bindings");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/bindings")).send());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return;
+    }
+    if let Some(bindings) = body["bindings"].as_array() {
+        if bindings.is_empty() {
+            println!("No agent bindings configured.");
+            return;
+        }
+        println!(
+            "{:<6} {:<20} {:<16} {:<16} {}",
+            "INDEX", "AGENT", "CHANNEL", "ACCOUNT", "PEER"
+        );
+        println!("{}", "-".repeat(74));
+        for (i, b) in bindings.iter().enumerate() {
+            println!(
+                "{:<6} {:<20} {:<16} {:<16} {}",
+                i,
+                b["agent"].as_str().unwrap_or("?"),
+                b["match_rule"]["channel"].as_str().unwrap_or("-"),
+                b["match_rule"]["account_id"].as_str().unwrap_or("-"),
+                b["match_rule"]["peer_id"].as_str().unwrap_or("-"),
+            );
+        }
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
     }
 }
 
@@ -5383,6 +5549,99 @@ fn cmd_vault_remove(key: &str) {
     }
 }
 
+fn cmd_vault_reload() {
+    let base = require_daemon("vault reload");
+    let home = openfang_home();
+    let vault_path = home.join("vault.enc");
+    let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path);
+
+    if !vault.exists() {
+        ui::error("Vault not initialized. Run: openfang vault init");
+        std::process::exit(1);
+    }
+    if let Err(e) = vault.unlock() {
+        ui::error(&format!("Could not unlock vault: {e}"));
+        std::process::exit(1);
+    }
+
+    let keys = vault.list_keys();
+    if keys.is_empty() {
+        println!("Vault is empty — nothing to reload.");
+        return;
+    }
+
+    // Push vault secrets to daemon via config reload
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/config/reload"))
+            .send(),
+    );
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Failed: {}",
+            body["error"].as_str().unwrap_or("?")
+        ));
+    } else {
+        ui::success(&format!(
+            "Config reloaded — {} vault key(s) will be re-read by providers.",
+            keys.len()
+        ));
+    }
+}
+
+fn cmd_vault_audit() {
+    let home = openfang_home();
+    let vault_path = home.join("vault.enc");
+    let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path.clone());
+
+    if !vault.exists() {
+        println!("Vault not initialized.");
+        return;
+    }
+
+    // Show file metadata
+    if let Ok(meta) = std::fs::metadata(&vault_path) {
+        use std::time::SystemTime;
+        let modified = meta
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        let hours = age.as_secs() / 3600;
+        println!("Vault file:     {}", vault_path.display());
+        println!("File size:      {} bytes", meta.len());
+        if hours < 24 {
+            println!("Last modified:  {}h ago", hours);
+        } else {
+            println!("Last modified:  {}d ago", hours / 24);
+        }
+    }
+
+    match vault.unlock() {
+        Ok(()) => {
+            let keys = vault.list_keys();
+            println!("Status:         unlocked");
+            println!("Stored keys:    {}", keys.len());
+            if !keys.is_empty() {
+                println!("\nKeys:");
+                for key in &keys {
+                    // Check if env var is actually set
+                    let in_env = std::env::var(key).is_ok();
+                    println!(
+                        "  {key:<30} {}",
+                        if in_env { "(active in env)" } else { "(not in env)" }
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            println!("Status:         locked ({})", e);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scaffold commands (openfang new skill/integration)
 // ---------------------------------------------------------------------------
@@ -5620,6 +5879,75 @@ fn cmd_models_set(model: Option<String>) {
         ));
     } else {
         ui::success(&format!("Default model set to: {model}"));
+    }
+}
+
+fn cmd_models_fallbacks(json: bool) {
+    let base = require_daemon("models fallbacks");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/models/fallbacks"))
+            .send(),
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return;
+    }
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Failed: {}",
+            body["error"].as_str().unwrap_or("?")
+        ));
+        return;
+    }
+    if let Some(chain) = body["fallback_providers"].as_array() {
+        if chain.is_empty() {
+            println!("No fallback providers configured.");
+            println!("\nAdd fallbacks in config.toml:");
+            println!("  [[fallback_providers]]");
+            println!("  provider = \"ollama\"");
+            println!("  model = \"llama3.2:latest\"");
+            return;
+        }
+        println!("Fallback Provider Chain ({} entries):\n", chain.len());
+        println!(
+            "  {:<4} {:<16} {:<30} {}",
+            "#", "PROVIDER", "MODEL", "API KEY ENV"
+        );
+        println!("  {}", "-".repeat(66));
+        for (i, entry) in chain.iter().enumerate() {
+            println!(
+                "  {:<4} {:<16} {:<30} {}",
+                i + 1,
+                entry["provider"].as_str().unwrap_or("?"),
+                entry["model"].as_str().unwrap_or("?"),
+                entry["api_key_env"].as_str().unwrap_or("-"),
+            );
+        }
+    }
+    if let Some(agent_fallbacks) = body["agent_fallbacks"].as_array() {
+        if !agent_fallbacks.is_empty() {
+            println!("\nPer-Agent Fallback Models:\n");
+            for af in agent_fallbacks {
+                let agent = af["agent"].as_str().unwrap_or("?");
+                if let Some(models) = af["fallback_models"].as_array() {
+                    if !models.is_empty() {
+                        println!("  Agent: {agent}");
+                        for m in models {
+                            println!(
+                                "    -> {}:{}",
+                                m["provider"].as_str().unwrap_or("?"),
+                                m["model"].as_str().unwrap_or("?"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -5870,6 +6198,82 @@ fn cmd_cron_toggle(id: &str, enable: bool) {
         ));
     } else {
         ui::success(&format!("Cron job {id} {endpoint}d."));
+    }
+}
+
+fn cmd_cron_run(id: &str) {
+    let base = require_daemon("cron run");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/cron/jobs/{id}/run"))
+            .send(),
+    );
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Failed: {}",
+            body["error"].as_str().unwrap_or("?")
+        ));
+    } else {
+        ui::success(&format!(
+            "Cron job {id} triggered. Poll status with: openfang cron status {id}"
+        ));
+    }
+}
+
+fn cmd_cron_status(id: &str, json: bool) {
+    let base = require_daemon("cron status");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/cron/jobs/{id}/status"))
+            .send(),
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return;
+    }
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Failed: {}",
+            body["error"].as_str().unwrap_or("?")
+        ));
+        return;
+    }
+    println!("Job:          {}", body["name"].as_str().unwrap_or(id));
+    println!(
+        "Enabled:      {}",
+        if body["enabled"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "Schedule:     {}",
+        body["cron_expr"].as_str().unwrap_or("-")
+    );
+    println!(
+        "Last run:     {}",
+        body["last_run"].as_str().unwrap_or("never")
+    );
+    println!(
+        "Next run:     {}",
+        body["next_run"].as_str().unwrap_or("-")
+    );
+    println!(
+        "Run count:    {}",
+        body["run_count"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "Fail count:   {}",
+        body["fail_count"].as_u64().unwrap_or(0)
+    );
+    if let Some(err) = body["last_error"].as_str() {
+        println!("Last error:   {err}");
     }
 }
 
@@ -6207,6 +6611,94 @@ fn cmd_memory_delete(agent: &str, key: &str) {
         ));
     } else {
         ui::success(&format!("Deleted key '{key}' for agent '{agent}'."));
+    }
+}
+
+fn cmd_memory_search(agent: &str, query: &str, json: bool) {
+    let base = require_daemon("memory search");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/memory/agents/{agent}/kv/search"))
+            .query(&[("q", query)])
+            .send(),
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return;
+    }
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Failed: {}",
+            body["error"].as_str().unwrap_or("?")
+        ));
+        return;
+    }
+    if let Some(results) = body["results"].as_array() {
+        if results.is_empty() {
+            println!("No matches for '{query}'.");
+            return;
+        }
+        println!("Matches for '{query}' ({} results):\n", results.len());
+        for r in results {
+            let key = r["key"].as_str().unwrap_or("?");
+            let val = &r["value"];
+            let val_str = if val.is_string() {
+                val.as_str().unwrap_or("").to_string()
+            } else {
+                serde_json::to_string(val).unwrap_or_default()
+            };
+            let truncated: String = val_str.chars().take(80).collect();
+            println!("  {key:<30} {truncated}");
+        }
+    }
+}
+
+fn cmd_memory_status(json: bool) {
+    let base = require_daemon("memory status");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/memory/status"))
+            .send(),
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return;
+    }
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Failed: {}",
+            body["error"].as_str().unwrap_or("?")
+        ));
+        return;
+    }
+    println!("Memory Subsystem Status");
+    println!("{}", "-".repeat(40));
+    println!(
+        "KV pairs:       {}",
+        body["kv_count"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "Agents stored:  {}",
+        body["agent_count"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "Sessions:       {}",
+        body["session_count"].as_u64().unwrap_or(0)
+    );
+    if let Some(size) = body["db_size_bytes"].as_u64() {
+        if size > 1_048_576 {
+            println!("Database size:  {:.1} MB", size as f64 / 1_048_576.0);
+        } else {
+            println!("Database size:  {:.1} KB", size as f64 / 1024.0);
+        }
     }
 }
 
